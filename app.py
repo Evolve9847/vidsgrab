@@ -4,10 +4,31 @@ from pathlib import Path
 app=Flask(__name__); ROOT=Path(__file__).parent; OUT=ROOT/"downloads"; OUT.mkdir(exist_ok=True)
 jobs={}; lock=threading.Lock()
 def valid(u): return u.startswith(("https://","http://")) and len(u)<4096
+
+def friendly_ytdlp_error(error):
+    """Translate common YouTube server-side bot challenges into a clear user message."""
+    raw = str(error)
+    low = raw.lower()
+    if ("sign in to confirm" in low or "not a bot" in low or
+            "confirm you're not a bot" in low or "login required" in low or
+            "use --cookies" in low):
+        return (
+            "YouTube is asking this hosting server to verify that it is not a bot. "
+            "This is a YouTube-side restriction and cannot be reliably fixed by the website. "
+            "Try again later, or download content you own through YouTube Studio. "
+            "Do not upload personal Google cookies to this public website."
+        )
+    return raw[:450]
 @app.get("/")
 def home():
  site_url=os.environ.get("SITE_URL",request.url_root.rstrip("/"))
  return render_template("index.html",site_url=site_url)
+@app.get("/privacy")
+def privacy():
+ return render_template("privacy.html",site_url=os.environ.get("SITE_URL",request.url_root.rstrip("/")))
+@app.get("/terms")
+def terms():
+ return render_template("terms.html",site_url=os.environ.get("SITE_URL",request.url_root.rstrip("/")))
 @app.get("/robots.txt")
 def robots():
  base=os.environ.get("SITE_URL",request.url_root.rstrip("/"))
@@ -16,7 +37,7 @@ def robots():
 @app.get("/sitemap.xml")
 def sitemap():
  base=os.environ.get("SITE_URL",request.url_root.rstrip("/"))
- xml='<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>'+base+'</loc><changefreq>weekly</changefreq><priority>1.0</priority></url></urlset>'
+ xml='<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'+''.join('<url><loc>'+base+path+'</loc><changefreq>monthly</changefreq><priority>'+priority+'</priority></url>' for path,priority in [("/","1.0"),("/privacy","0.3"),("/terms","0.3")])+'</urlset>' 
  return app.response_class(xml,mimetype="application/xml")
 @app.get("/healthz")
 def healthz():
@@ -26,10 +47,16 @@ def info():
  u=(request.json or {}).get("url","").strip()
  if not valid(u): return jsonify(error="Enter a valid public video URL"),400
  try:
-  with yt_dlp.YoutubeDL({"quiet":True,"skip_download":True,"noplaylist":True}) as y: m=y.extract_info(u,download=False)
+  with yt_dlp.YoutubeDL({
+   "quiet":True,
+   "skip_download":True,
+   "noplaylist":True,
+   "js_runtimes":{"deno":{}},
+   "remote_components":{"ejs:github":{}},
+  }) as y: m=y.extract_info(u,download=False)
   hs=sorted({f.get("height") for f in m.get("formats",[]) if f.get("height") and f.get("vcodec")!="none"})
   return jsonify(title=m.get("title","Video"),thumbnail=m.get("thumbnail"),duration=m.get("duration"),heights=hs)
- except Exception as e: return jsonify(error=str(e)[:450]),400
+ except Exception as e: return jsonify(error=friendly_ytdlp_error(e)),400
 @app.post("/api/download")
 def start():
  d=request.json or {}; u=d.get("url","").strip(); mode=d.get("mode","video"); quality=str(d.get("quality","best")); audio_quality=str(d.get("audio_quality","192")); selected_audio_quality=audio_quality if audio_quality in {"128","192","256","320"} else "192"
@@ -53,7 +80,9 @@ def start():
     fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
    else:
     fmt = f"bestvideo[ext=mp4][vcodec^=avc1][height<={quality}]+bestaudio[ext=m4a]/best[ext=mp4][height<={quality}]/best[height<={quality}]/best"
-   opts={"format":fmt,"outtmpl":str(OUT/(jid+"_%(title).100B.%(ext)s")),"noplaylist":True,"quiet":True,"progress_hooks":[hook],"merge_output_format":"mp4","restrictfilenames":True}
+   opts={"format":fmt,"outtmpl":str(OUT/(jid+"_%(title).100B.%(ext)s")),"noplaylist":True,"quiet":True,"progress_hooks":[hook],"merge_output_format":"mp4","restrictfilenames":True,
+          "js_runtimes":{"deno":{}},
+          "remote_components":{"ejs:github":{}}}
    if mode=="audio":
     # The validated bitrate is captured before the worker thread starts.
     opts["postprocessors"]=[{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":selected_audio_quality}]
@@ -80,7 +109,7 @@ def start():
    with lock:
     jobs[jid].update(status="done", progress=100, path=str(p), name=p.name)
   except Exception as e:
-   err=str(e)
+   err=friendly_ytdlp_error(e)
    # If MP3 extraction fails in FFmpeg, keep the downloaded source audio
    # (typically M4A) and still deliver it rather than losing the whole job.
    if mode=="audio":
